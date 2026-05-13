@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Run outputs (imagery, intermediate JSON, reports).
+# data/ is auto-created by the scripts.
+data/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
