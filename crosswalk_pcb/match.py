@@ -197,47 +197,231 @@ def render_stripe_masks(
     return masks
 
 
+def _pair_by_side(
+    fp: Footprint,
+    stripes: list[Stripe],
+    cw_center: tuple[float, float],
+    rotation_k: int,
+) -> list[tuple[Pad, Stripe]] | None:
+    """Pair pads with stripes by sorting per side and matching by rank.
+
+    rotation_k rotates the footprint's side assignment so that its N side
+    aligns with the crosswalk's N side. Returns None if any side has a
+    count mismatch."""
+    # Classify pads into NESW.
+    cx_fp = sum(p.x for p in fp.pads) / len(fp.pads)
+    cy_fp = sum(p.y for p in fp.pads) / len(fp.pads)
+    pad_sides: dict[str, list[Pad]] = {"N": [], "E": [], "S": [], "W": []}
+    for p in fp.pads:
+        pad_sides[_classify_pad_side(p, cx_fp, cy_fp)].append(p)
+
+    # Rotate pad side labels by rotation_k.
+    labels = ["N", "E", "S", "W"]
+    rotated_labels = labels[rotation_k:] + labels[:rotation_k]
+    # rotated_labels[i] is the original side that maps to labels[i] after rotation.
+    # e.g. rotation_k=1: rotated_labels = [E, S, W, N]
+    # meaning: what was E is now N, S→E, W→S, N→W.
+    pad_sides_rotated: dict[str, list[Pad]] = {}
+    for i, new_label in enumerate(labels):
+        old_label = rotated_labels[i]
+        pad_sides_rotated[new_label] = pad_sides[old_label]
+
+    # Classify stripes into NESW.
+    stripe_sides: dict[str, list[Stripe]] = {"N": [], "E": [], "S": [], "W": []}
+    for s in stripes:
+        dx = s.cx - cw_center[0]
+        dy = s.cy - cw_center[1]
+        if abs(dy) >= abs(dx):
+            side = "N" if dy < 0 else "S"
+        else:
+            side = "E" if dx > 0 else "W"
+        stripe_sides[side].append(s)
+
+    # Sort each side by position along the edge and pair by rank.
+    pairs: list[tuple[Pad, Stripe]] = []
+    for label in labels:
+        pads = pad_sides_rotated[label]
+        ss = stripe_sides[label]
+        if len(pads) != len(ss):
+            return None
+        if not pads:
+            continue
+        # N/S sides: sort by x. E/W sides: sort by y.
+        if label in ("N", "S"):
+            pads.sort(key=lambda p: p.x)
+            ss.sort(key=lambda s: s.cx)
+        else:
+            pads.sort(key=lambda p: p.y)
+            ss.sort(key=lambda s: s.cy)
+        for pad, stripe in zip(pads, ss):
+            pairs.append((pad, stripe))
+    return pairs
+
+
+def _solve_similarity_transform(
+    src: np.ndarray, dst: np.ndarray,
+) -> tuple[float, float, float, float] | None:
+    """Find uniform scale + rotation + translation mapping src points to dst.
+
+    src, dst: (N, 2) arrays of corresponding points.
+    Returns (scale, angle_rad, tx, ty) or None if degenerate.
+
+    Uses the closed-form Umeyama solution for similarity transforms."""
+    n = src.shape[0]
+    if n < 2:
+        return None
+    src_c = src.mean(axis=0)
+    dst_c = dst.mean(axis=0)
+    src_centered = src - src_c
+    dst_centered = dst - dst_c
+    # Cross-covariance.
+    H = src_centered.T @ dst_centered / n
+    U, S, Vt = np.linalg.svd(H)
+    # Handle reflection.
+    d = np.linalg.det(Vt.T @ U.T)
+    D = np.diag([1.0, 1.0 if d > 0 else -1.0])
+    R = Vt.T @ D @ U.T
+    # Uniform scale: ratio of dst spread to src spread.
+    src_var = np.sum(src_centered ** 2) / n
+    if src_var < 1e-12:
+        return None
+    scale = np.trace(np.diag(S) @ D) / src_var
+    # Translation.
+    t = dst_c - scale * R @ src_c
+    angle = math.atan2(R[1, 0], R[0, 0])
+    return float(scale), float(angle), float(t[0]), float(t[1])
+
+
 def check_1to1(
     fp: Footprint,
     stripes: list[Stripe],
+    cw_center: tuple[float, float],
     rotation_k: int,
     canvas: int = CANVAS,
-) -> tuple[bool, list[tuple[int, int]]]:
-    """Check if every pad has exactly one overlapping stripe and no stripe
-    is shared by multiple pads.
+) -> tuple[bool, list[tuple[int, int]], float]:
+    """Check if every pad has exactly one overlapping stripe using a
+    best-fit similarity transform (uniform scale + rotation + translate).
 
-    Returns (is_valid, pairs) where pairs is a list of (pad_idx, stripe_idx)
-    for successful mappings."""
-    pad_masks = render_footprint_masks(fp, canvas, rotation_k)
-    stripe_masks = render_stripe_masks(stripes, canvas)
+    Steps:
+      1. Pair pads and stripes by side + rank order.
+      2. Compute the similarity transform mapping stripe centroids → pad centroids.
+      3. Render footprint pads in footprint-mm space.
+      4. Transform stripe positions/angles into that same space and render.
+      5. Check every pad mask overlaps exactly one stripe mask (1:1).
 
-    if not pad_masks or not stripe_masks:
-        return False, []
+    Returns (is_valid, pairs_as_indices, residual_error)."""
+    pairs = _pair_by_side(fp, stripes, cw_center, rotation_k)
+    if pairs is None:
+        return False, [], float("inf")
 
-    # Build overlap matrix: overlap[i][j] = True if pad i overlaps stripe j.
-    n_pads = len(pad_masks)
-    n_stripes = len(stripe_masks)
-    overlap = np.zeros((n_pads, n_stripes), dtype=bool)
-    for i, pm in enumerate(pad_masks):
-        pm_bool = pm > 0
-        for j, sm in enumerate(stripe_masks):
-            if np.any(pm_bool & (sm > 0)):
-                overlap[i, j] = True
+    # Build point correspondences: stripe centroid → pad centroid.
+    src = np.array([[s.cx, s.cy] for _, s in pairs])
+    dst = np.array([[p.x, p.y] for p, _ in pairs])
+    result = _solve_similarity_transform(src, dst)
+    if result is None:
+        return False, [], float("inf")
+    scale, angle, tx, ty = result
 
-    # Check: every pad must overlap exactly one stripe.
-    pairs: list[tuple[int, int]] = []
-    for i in range(n_pads):
-        matched = np.where(overlap[i])[0]
-        if len(matched) != 1:
-            return False, []
-        pairs.append((i, int(matched[0])))
+    # Compute residual: mean distance between transformed stripe centers and pad centers.
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    transformed = np.column_stack([
+        scale * (cos_a * src[:, 0] - sin_a * src[:, 1]) + tx,
+        scale * (sin_a * src[:, 0] + cos_a * src[:, 1]) + ty,
+    ])
+    residuals = np.sqrt(np.sum((transformed - dst) ** 2, axis=1))
+    mean_residual = float(residuals.mean())
 
-    # Check: no stripe matched by more than one pad.
-    assigned_stripes = [p[1] for p in pairs]
-    if len(set(assigned_stripes)) != len(assigned_stripes):
-        return False, []
+    # Render everything in footprint-mm space.
+    # Compute the footprint transform to canvas.
+    fp_scale, fp_off_x, fp_off_y = _fp_transform(fp, canvas)
 
-    return True, pairs
+    # Render each pad as an individual mask.
+    pad_masks: list[np.ndarray] = []
+    for p in fp.pads:
+        long_dim, pad_angle = _pad_long_axis(p)
+        m = _render_single_mark(canvas, p.x, p.y, long_dim, pad_angle,
+                                fp_scale, fp_off_x, fp_off_y)
+        pad_masks.append(m)
+
+    # Render each stripe transformed into footprint-mm space.
+    angle_deg = math.degrees(angle)
+    stripe_masks: list[np.ndarray] = []
+    for _, s in pairs:
+        # Transform stripe center.
+        tx_s = scale * (cos_a * s.cx - sin_a * s.cy) + tx
+        ty_s = scale * (sin_a * s.cx + cos_a * s.cy) + ty
+        # Transform stripe dimensions and angle.
+        long_dim = s.length_px * scale
+        stripe_angle = s.angle_deg + angle_deg
+        m = _render_single_mark(canvas, tx_s, ty_s, long_dim, stripe_angle,
+                                fp_scale, fp_off_x, fp_off_y)
+        stripe_masks.append(m)
+
+    # The global similarity transform residual captures both per-side
+    # spacing AND cross-side body aspect. For crosswalk-to-footprint matching,
+    # the body aspect will always differ (road vs IC), so a global residual
+    # is too strict.
+    #
+    # Instead, check per-side: normalize pad and stripe positions to [0,1]
+    # along each edge and verify the spacing pattern matches within each side.
+    # This correctly tests "are stripes evenly spaced like the pads?" while
+    # ignoring the road-vs-IC body proportions.
+    is_valid = _check_per_side_spacing(pairs, cw_center, rotation_k, fp)
+    idx_pairs_tuples = [(i, i) for i in range(len(pairs))]
+    return is_valid, idx_pairs_tuples, mean_residual
+
+
+def _check_per_side_spacing(
+    pairs: list[tuple[Pad, Stripe]],
+    cw_center: tuple[float, float],
+    rotation_k: int,
+    fp: Footprint,
+    tol: float = 0.15,
+) -> bool:
+    """Check that within each side, the normalized positions of stripes
+    match the normalized positions of pads (within tolerance).
+
+    tol: max allowed difference in normalized [0,1] position between
+    a pad and its paired stripe. 0.15 means each stripe can be off by
+    up to 15% of the side's span."""
+    # Re-classify pairs into sides (using the pad's side assignment).
+    cx_fp = sum(p.x for p in fp.pads) / len(fp.pads)
+    cy_fp = sum(p.y for p in fp.pads) / len(fp.pads)
+    labels = ["N", "E", "S", "W"]
+    rotated_labels = labels[rotation_k:] + labels[:rotation_k]
+
+    side_pairs: dict[str, list[tuple[Pad, Stripe]]] = {l: [] for l in labels}
+    for pad, stripe in pairs:
+        orig_side = _classify_pad_side(pad, cx_fp, cy_fp)
+        # Map original side to rotated side.
+        new_side = labels[rotated_labels.index(orig_side)]
+        side_pairs[new_side].append((pad, stripe))
+
+    for side_label, sp in side_pairs.items():
+        if len(sp) < 2:
+            continue
+        # Determine the array axis: N/S → x, E/W → y.
+        if side_label in ("N", "S"):
+            pad_pos = [p.x for p, _ in sp]
+            stripe_pos = [s.cx for _, s in sp]
+        else:
+            pad_pos = [p.y for p, _ in sp]
+            stripe_pos = [s.cy for _, s in sp]
+        # Normalize both to [0, 1].
+        p_min, p_max = min(pad_pos), max(pad_pos)
+        s_min, s_max = min(stripe_pos), max(stripe_pos)
+        p_span = p_max - p_min
+        s_span = s_max - s_min
+        if p_span < 1e-9 or s_span < 1e-9:
+            continue
+        pad_norm = sorted((v - p_min) / p_span for v in pad_pos)
+        stripe_norm = sorted((v - s_min) / s_span for v in stripe_pos)
+        # Check each pair.
+        for pn, sn in zip(pad_norm, stripe_norm):
+            if abs(pn - sn) > tol:
+                return False
+    return True
 
 
 # ---------- comparison ----------
@@ -435,8 +619,9 @@ def find_exact_matches(
         matches, count_rot_k = _counts_match(fp_counts, cw_counts)
         if not matches:
             continue
-        # Stage 2: check 1:1 spatial overlap.
-        is_valid, pairs = check_1to1(fp, all_stripes, count_rot_k, canvas)
+        # Stage 2: check 1:1 spatial overlap via similarity transform.
+        is_valid, pairs, residual = check_1to1(
+            fp, all_stripes, image_center, count_rot_k, canvas)
         if not is_valid:
             continue
         # Passed both filters — compute IoU for ranking.
