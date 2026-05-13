@@ -59,22 +59,35 @@ def _draw_mark(
 ) -> None:
     """Draw a thin filled rectangle: long axis at `angle_deg`, short axis
     fixed to `mark_px` pixels regardless of scale."""
+    _draw_rect_real(img, cx, cy, long_dim, mark_px / scale,
+                    angle_deg, scale, off_x, off_y)
+
+
+def _draw_rect_real(
+    img: np.ndarray,
+    cx: float, cy: float,
+    w: float, h: float,
+    angle_deg: float,
+    scale: float, off_x: float, off_y: float,
+) -> None:
+    """Draw a filled rectangle at real dimensions (both axes scaled).
+    w = extent along angle_deg, h = extent perpendicular."""
     px = cx * scale + off_x
     py = cy * scale + off_y
-    pl = long_dim * scale       # long axis in pixels
-    pw = float(mark_px)         # short axis fixed
+    pw = w * scale
+    ph = h * scale
 
     cos_a = math.cos(math.radians(angle_deg))
     sin_a = math.sin(math.radians(angle_deg))
-    u = np.array([cos_a, sin_a])  # unit vector along long axis
-    v = np.array([-sin_a, cos_a]) # unit vector along short axis
+    u = np.array([cos_a, sin_a])
+    v = np.array([-sin_a, cos_a])
     c = np.array([px, py])
-    hl, hw = pl / 2, pw / 2
+    hw, hh = pw / 2, ph / 2
     pts = np.array([
-        c + hl * u + hw * v,
-        c - hl * u + hw * v,
-        c - hl * u - hw * v,
-        c + hl * u - hw * v,
+        c + hw * u + hh * v,
+        c - hw * u + hh * v,
+        c - hw * u - hh * v,
+        c + hw * u - hh * v,
     ], dtype=np.int32)
     cv2.fillPoly(img, [pts], 255)
 
@@ -358,70 +371,56 @@ def check_1to1(
                                 fp_scale, fp_off_x, fp_off_y)
         stripe_masks.append(m)
 
-    # The global similarity transform residual captures both per-side
-    # spacing AND cross-side body aspect. For crosswalk-to-footprint matching,
-    # the body aspect will always differ (road vs IC), so a global residual
-    # is too strict.
-    #
-    # Instead, check per-side: normalize pad and stripe positions to [0,1]
-    # along each edge and verify the spacing pattern matches within each side.
-    # This correctly tests "are stripes evenly spaced like the pads?" while
-    # ignoring the road-vs-IC body proportions.
-    is_valid = _check_per_side_spacing(pairs, cw_center, rotation_k, fp)
-    idx_pairs_tuples = [(i, i) for i in range(len(pairs))]
-    return is_valid, idx_pairs_tuples, mean_residual
+    # Render pads and transformed stripes at REAL dimensions in mm space,
+    # then check 1:1 pixel overlap. This is the honest test: does each
+    # pad's actual rectangle overlap exactly one stripe's actual rectangle?
+    fp_scale, fp_off_x, fp_off_y = _fp_transform(fp, canvas)
 
+    # Render each pad individually at real mm dimensions.
+    pad_masks: list[np.ndarray] = []
+    for p in fp.pads:
+        long_dim, pad_angle = _pad_long_axis(p)
+        short_dim = min(p.width, p.height)
+        m = np.zeros((canvas, canvas), dtype=np.uint8)
+        _draw_rect_real(m, p.x, p.y, long_dim, short_dim, pad_angle,
+                        fp_scale, fp_off_x, fp_off_y)
+        pad_masks.append(m)
 
-def _check_per_side_spacing(
-    pairs: list[tuple[Pad, Stripe]],
-    cw_center: tuple[float, float],
-    rotation_k: int,
-    fp: Footprint,
-    tol: float = 0.15,
-) -> bool:
-    """Check that within each side, the normalized positions of stripes
-    match the normalized positions of pads (within tolerance).
+    # Render each stripe transformed into mm space at real dimensions.
+    stripe_masks: list[np.ndarray] = []
+    for _, s in pairs:
+        sx = scale * (cos_a * s.cx - sin_a * s.cy) + tx
+        sy = scale * (sin_a * s.cx + cos_a * s.cy) + ty
+        s_long = s.length_px * scale  # length in mm after transform
+        s_short = s.width_px * scale  # width in mm after transform
+        s_angle = s.angle_deg + angle_deg
+        m = np.zeros((canvas, canvas), dtype=np.uint8)
+        _draw_rect_real(m, sx, sy, s_long, s_short, s_angle,
+                        fp_scale, fp_off_x, fp_off_y)
+        stripe_masks.append(m)
 
-    tol: max allowed difference in normalized [0,1] position between
-    a pad and its paired stripe. 0.15 means each stripe can be off by
-    up to 15% of the side's span."""
-    # Re-classify pairs into sides (using the pad's side assignment).
-    cx_fp = sum(p.x for p in fp.pads) / len(fp.pads)
-    cy_fp = sum(p.y for p in fp.pads) / len(fp.pads)
-    labels = ["N", "E", "S", "W"]
-    rotated_labels = labels[rotation_k:] + labels[:rotation_k]
+    # Check 1:1 overlap.
+    n_pads = len(pad_masks)
+    n_stripes = len(stripe_masks)
+    overlap = np.zeros((n_pads, n_stripes), dtype=bool)
+    for i, pm in enumerate(pad_masks):
+        pm_bool = pm > 0
+        for j, sm in enumerate(stripe_masks):
+            if np.any(pm_bool & (sm > 0)):
+                overlap[i, j] = True
 
-    side_pairs: dict[str, list[tuple[Pad, Stripe]]] = {l: [] for l in labels}
-    for pad, stripe in pairs:
-        orig_side = _classify_pad_side(pad, cx_fp, cy_fp)
-        # Map original side to rotated side.
-        new_side = labels[rotated_labels.index(orig_side)]
-        side_pairs[new_side].append((pad, stripe))
+    idx_pairs: list[tuple[int, int]] = []
+    for i in range(n_pads):
+        matched = np.where(overlap[i])[0]
+        if len(matched) != 1:
+            return False, [], mean_residual
+        idx_pairs.append((i, int(matched[0])))
 
-    for side_label, sp in side_pairs.items():
-        if len(sp) < 2:
-            continue
-        # Determine the array axis: N/S → x, E/W → y.
-        if side_label in ("N", "S"):
-            pad_pos = [p.x for p, _ in sp]
-            stripe_pos = [s.cx for _, s in sp]
-        else:
-            pad_pos = [p.y for p, _ in sp]
-            stripe_pos = [s.cy for _, s in sp]
-        # Normalize both to [0, 1].
-        p_min, p_max = min(pad_pos), max(pad_pos)
-        s_min, s_max = min(stripe_pos), max(stripe_pos)
-        p_span = p_max - p_min
-        s_span = s_max - s_min
-        if p_span < 1e-9 or s_span < 1e-9:
-            continue
-        pad_norm = sorted((v - p_min) / p_span for v in pad_pos)
-        stripe_norm = sorted((v - s_min) / s_span for v in stripe_pos)
-        # Check each pair.
-        for pn, sn in zip(pad_norm, stripe_norm):
-            if abs(pn - sn) > tol:
-                return False
-    return True
+    assigned = [p[1] for p in idx_pairs]
+    if len(set(assigned)) != len(assigned):
+        return False, [], mean_residual
+
+    return True, idx_pairs, mean_residual
 
 
 # ---------- comparison ----------
@@ -519,6 +518,97 @@ def render_comparison(match: MatchResult) -> np.ndarray:
     cv2.putText(strip, f"FP: {match.footprint_name}", (4, 16), font, 0.45, (0, 200, 200), 1)
     cv2.putText(strip, "crosswalk", (w + 4, 16), font, 0.45, (0, 200, 200), 1)
     cv2.putText(strip, f"IoU={match.iou:.3f}", (2 * w + 4, 16), font, 0.45, (0, 200, 200), 1)
+
+    return strip
+
+
+def render_aligned_comparison(
+    fp: Footprint,
+    stripes: list[Stripe],
+    cw_center: tuple[float, float],
+    rotation_k: int,
+    canvas: int = CANVAS,
+    aerial_bgr: np.ndarray | None = None,
+    detection_overlay_bgr: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Render footprint and crosswalk stripes in a SHARED coordinate space.
+
+    The crosswalk stripes are transformed into the footprint's mm space
+    via the similarity transform computed from paired correspondences.
+
+    If aerial_bgr and/or detection_overlay_bgr are provided, they are
+    prepended as extra panels: [aerial] [detection] [footprint] [aligned CW] [overlap].
+
+    Returns a multi-panel BGR image, or None if pairing fails."""
+    pairs = _pair_by_side(fp, stripes, cw_center, rotation_k)
+    if pairs is None or len(pairs) < 2:
+        return None
+
+    # Compute similarity transform: stripe coords → footprint mm coords.
+    src = np.array([[s.cx, s.cy] for _, s in pairs])
+    dst = np.array([[p.x, p.y] for p, _ in pairs])
+    result = _solve_similarity_transform(src, dst)
+    if result is None:
+        return None
+    scale_t, angle_t, tx, ty = result
+    cos_a = math.cos(angle_t)
+    sin_a = math.sin(angle_t)
+    angle_deg_t = math.degrees(angle_t)
+
+    # Render footprint at real pad dimensions in mm space.
+    fp_scale, fp_off_x, fp_off_y = _fp_transform(fp, canvas)
+    fp_img = np.zeros((canvas, canvas), dtype=np.uint8)
+    for p in fp.pads:
+        long_dim, pad_angle = _pad_long_axis(p)
+        short_dim = min(p.width, p.height)
+        _draw_rect_real(fp_img, p.x, p.y, long_dim, short_dim, pad_angle,
+                        fp_scale, fp_off_x, fp_off_y)
+
+    # Render stripes transformed into mm space at real dimensions.
+    cw_img = np.zeros((canvas, canvas), dtype=np.uint8)
+    all_stripes = [s for _, s in pairs]
+    for s in all_stripes:
+        sx = scale_t * (cos_a * s.cx - sin_a * s.cy) + tx
+        sy = scale_t * (sin_a * s.cx + cos_a * s.cy) + ty
+        s_long = s.length_px * scale_t
+        s_short = s.width_px * scale_t
+        s_angle = s.angle_deg + angle_deg_t
+        _draw_rect_real(cw_img, sx, sy, s_long, s_short, s_angle,
+                        fp_scale, fp_off_x, fp_off_y)
+
+    # Build 5-panel image:
+    # [aerial tile] [aerial + detection overlay] [footprint] [crosswalk aligned] [overlap]
+    h, w = fp_img.shape
+    overlap_img = np.zeros((h, w, 3), dtype=np.uint8)
+    fp_bool = fp_img > 127
+    cw_bool = cw_img > 127
+    overlap_img[fp_bool & ~cw_bool] = (0, 180, 0)
+    overlap_img[cw_bool & ~fp_bool] = (0, 0, 180)
+    overlap_img[fp_bool & cw_bool] = (255, 255, 255)
+
+    fp_bgr = cv2.cvtColor(fp_img, cv2.COLOR_GRAY2BGR)
+    cw_bgr = cv2.cvtColor(cw_img, cv2.COLOR_GRAY2BGR)
+
+    # If aerial imagery and detection overlay are provided, prepend them.
+    panels = [fp_bgr, cw_bgr, overlap_img]
+    labels = [f"FP: {fp.name}", "crosswalk (aligned)", "overlap"]
+
+    if aerial_bgr is not None:
+        # Resize aerial to match canvas.
+        aerial_resized = cv2.resize(aerial_bgr, (w, h))
+        panels.insert(0, aerial_resized)
+        labels.insert(0, "aerial")
+    if detection_overlay_bgr is not None:
+        det_resized = cv2.resize(detection_overlay_bgr, (w, h))
+        panels.insert(1 if aerial_bgr is not None else 0, det_resized)
+        labels.insert(1 if aerial_bgr is not None else 0, "detection")
+
+    strip = np.hstack(panels)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    x_off = 0
+    for i, label in enumerate(labels):
+        cv2.putText(strip, label, (x_off + 4, 16), font, 0.4, (0, 200, 200), 1)
+        x_off += w
 
     return strip
 
