@@ -27,6 +27,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from crosswalk_pcb.detect import (
+    align_image_to_roads,
     draw_overlay,
     extract_stripes,
     find_paint_mask,
@@ -105,6 +106,12 @@ def main() -> int:
             continue
         bgr = pil_to_bgr(res.image)
         try:
+            # Rotate so roads are axis-aligned; simplifies side assignment.
+            leg_bearings = cand.get("leg_bearings_deg", [])
+            if leg_bearings:
+                bgr, rot_deg = align_image_to_roads(bgr, leg_bearings)
+            else:
+                rot_deg = 0.0
             mask = find_paint_mask(bgr)
             stripes = extract_stripes(mask, m_per_px=res.m_per_px)
             arrays = group_stripes_into_arrays(stripes)
@@ -132,6 +139,7 @@ def main() -> int:
             "thumb": str(thumb_path.relative_to(out_dir)),
             "overlay": str(overlay_path.relative_to(out_dir)),
             "m_per_px": round(res.m_per_px, 3),
+            "rotation_deg": round(rot_deg, 2),
         }
         results.append(rec)
         print(f"  {sid} {lat:.5f},{lon:.5f}  "

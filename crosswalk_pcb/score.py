@@ -83,61 +83,62 @@ def _angular_diff(a: float, b: float) -> float:
     return min(d, 360.0 - d)
 
 
-def _cluster_arrays_by_bearing(
-    arrays: list[StripeArray], center: tuple[float, float], tol_deg: float = 35.0
-) -> list[SideStats]:
-    """Group arrays whose bearings-from-center are within tol_deg of each other.
+def _assign_quadrant(cx: float, cy: float, center: tuple[float, float]) -> str:
+    """Fixed 4-quadrant assignment: N / E / S / W.
 
-    Real crosswalks on the same leg may be drawn as a single array or split into
-    two (one stripe pattern per direction of travel). Both cases land here as a
-    single 'side'.
-    """
-    enriched = []
+    After align_image_to_roads(), roads are axis-aligned, so array centroids
+    fall cleanly into one of four quadrants relative to image center."""
+    dx = cx - center[0]
+    dy = cy - center[1]  # positive = below center in image coords
+    if abs(dy) >= abs(dx):
+        return "N" if dy < 0 else "S"
+    else:
+        return "E" if dx > 0 else "W"
+
+
+def _build_sides_by_quadrant(
+    arrays: list[StripeArray], center: tuple[float, float]
+) -> list[SideStats]:
+    """Assign each array to a fixed N/E/S/W quadrant and merge into SideStats.
+
+    Much simpler than the old bearing-cluster approach; relies on the image
+    being pre-rotated so roads are axis-aligned."""
+    buckets: dict[str, list[tuple[StripeArray, float]]] = {
+        "N": [], "E": [], "S": [], "W": [],
+    }
+    # Fixed cardinal bearings for each quadrant.
+    CARDINAL = {"N": 0.0, "E": 90.0, "S": 180.0, "W": 270.0}
+
     for arr in arrays:
-        b = _bearing_from_center(arr.centroid[0], arr.centroid[1], center)
-        arr.bearing_from_center_deg = b
         d = math.hypot(arr.centroid[0] - center[0], arr.centroid[1] - center[1])
-        enriched.append((b, d, arr))
-    enriched.sort(key=lambda t: t[0])
+        q = _assign_quadrant(arr.centroid[0], arr.centroid[1], center)
+        arr.bearing_from_center_deg = CARDINAL[q]
+        buckets[q].append((arr, d))
 
     sides: list[SideStats] = []
-    for b, d, arr in enriched:
-        placed = False
-        for s in sides:
-            if _angular_diff(b, s.bearing_deg) <= tol_deg:
-                s.arrays.append(arr)
-                # Update running mean bearing using vector mean (handles wraparound).
-                bs = [_bearing_from_center(a.centroid[0], a.centroid[1], center) for a in s.arrays]
-                sx = sum(math.sin(math.radians(bb)) for bb in bs)
-                sy = sum(math.cos(math.radians(bb)) for bb in bs)
-                s.bearing_deg = (math.degrees(math.atan2(sx, sy)) + 360.0) % 360.0
-                s.total_stripes += arr.n_stripes
-                # update pitch stats
-                pitches = []
-                for a in s.arrays:
-                    pitches.extend([a.pitch_px] * max(0, a.n_stripes - 1))
-                if pitches:
-                    mean_p = sum(pitches) / len(pitches)
-                    var = sum((p - mean_p) ** 2 for p in pitches) / len(pitches)
-                    s.mean_pitch_px = mean_p
-                    s.pitch_cv = math.sqrt(var) / (mean_p + 1e-6)
-                # distance: mean of contributing array distances
-                ds = [math.hypot(a.centroid[0] - center[0], a.centroid[1] - center[1])
-                      for a in s.arrays]
-                s.distance_from_center_px = sum(ds) / len(ds)
-                placed = True
-                break
-        if not placed:
-            sides.append(
-                SideStats(
-                    bearing_deg=b,
-                    arrays=[arr],
-                    total_stripes=arr.n_stripes,
-                    mean_pitch_px=arr.pitch_px,
-                    pitch_cv=arr.pitch_cv,
-                    distance_from_center_px=d,
-                )
-            )
+    for q in ("N", "E", "S", "W"):
+        items = buckets[q]
+        if not items:
+            continue
+        arrs = [a for a, _ in items]
+        total = sum(a.n_stripes for a in arrs)
+        # Weighted-average pitch stats across arrays on this side.
+        pitches = []
+        for a in arrs:
+            if a.n_stripes >= 2:
+                pitches.extend([a.pitch_px] * (a.n_stripes - 1))
+        mean_p = sum(pitches) / len(pitches) if pitches else 0.0
+        var = (sum((p - mean_p) ** 2 for p in pitches) / len(pitches)) if pitches else 0.0
+        cv = math.sqrt(var) / (mean_p + 1e-6) if pitches else 1.0
+        mean_d = sum(d for _, d in items) / len(items)
+        sides.append(SideStats(
+            bearing_deg=CARDINAL[q],
+            arrays=arrs,
+            total_stripes=total,
+            mean_pitch_px=mean_p,
+            pitch_cv=cv,
+            distance_from_center_px=mean_d,
+        ))
     return sides
 
 
@@ -154,7 +155,7 @@ def score_match(
         if math.hypot(a.centroid[0] - image_center[0],
                       a.centroid[1] - image_center[1]) <= max_distance_from_center_px
     ]
-    sides = _cluster_arrays_by_bearing(near_arrays, image_center)
+    sides = _build_sides_by_quadrant(near_arrays, image_center)
     # Drop trivially-small sides.
     sides = [s for s in sides if s.total_stripes >= min_stripes_per_side]
     sides.sort(key=lambda s: -s.total_stripes)

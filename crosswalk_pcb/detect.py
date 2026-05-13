@@ -57,6 +57,36 @@ def find_paint_mask(
     return ((white_mask | yellow_mask).astype(np.uint8) * 255)
 
 
+# ---------- image alignment ----------
+
+def align_image_to_roads(
+    image_bgr: np.ndarray, leg_bearings_deg: list[float]
+) -> tuple[np.ndarray, float]:
+    """Rotate image so the road closest to a cardinal direction becomes
+    exactly axis-aligned. Returns (rotated_image, rotation_degrees).
+
+    leg_bearings_deg are compass bearings (0=up/north, CW) from the OSM
+    junction data. We find whichever leg is closest to any multiple of 90°
+    and rotate the image to close that gap.
+
+    cv2.getRotationMatrix2D uses CCW-positive angles, and our bearings are
+    CW-from-north in image coords (y-down). A leg at bearing B needs
+    rotation = -(B - nearest_cardinal) in cv2's convention."""
+    best_dev = 180.0
+    for b in leg_bearings_deg:
+        for card in (0, 90, 180, 270):
+            diff = ((b - card + 180) % 360) - 180  # signed, [-180, 180)
+            if abs(diff) < abs(best_dev):
+                best_dev = diff
+    rotation_deg = -best_dev
+    h, w = image_bgr.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), rotation_deg, 1.0)
+    rotated = cv2.warpAffine(
+        image_bgr, M, (w, h), borderMode=cv2.BORDER_REPLICATE
+    )
+    return rotated, rotation_deg
+
+
 # ---------- stripe extraction ----------
 
 @dataclass
