@@ -18,9 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
 from PIL import Image
 
 from .tiles import TILE_SIZE, TileWindow, ground_resolution_m_per_px, tile_window_for_center
+
+# Auto-load .env from the repo root (walks up from this file).
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 USER_AGENT = "crosswalk-pcb-prototype/0.1 (https://github.com/samdorey/stm32_crossroads)"
 

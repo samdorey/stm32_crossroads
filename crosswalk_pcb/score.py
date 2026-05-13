@@ -145,9 +145,16 @@ def score_match(
     arrays: list[StripeArray],
     image_center: tuple[float, float],
     min_stripes_per_side: int = 3,
+    max_distance_from_center_px: float = 300.0,
 ) -> PackageMatch:
     """Compute the PCB-similarity for one intersection's detection."""
-    sides = _cluster_arrays_by_bearing(arrays, image_center)
+    # Pre-filter: drop arrays too far from center (likely rooftop / parking lot noise).
+    near_arrays = [
+        a for a in arrays
+        if math.hypot(a.centroid[0] - image_center[0],
+                      a.centroid[1] - image_center[1]) <= max_distance_from_center_px
+    ]
+    sides = _cluster_arrays_by_bearing(near_arrays, image_center)
     # Drop trivially-small sides.
     sides = [s for s in sides if s.total_stripes >= min_stripes_per_side]
     sides.sort(key=lambda s: -s.total_stripes)
@@ -185,9 +192,10 @@ def score_match(
     pitch_regularity = sum(pitch_reg_per_side) / len(pitch_reg_per_side)
 
     # --- pin count consistency: for opposing sides, how similar are the counts?
+    # Use sqrt of ratio so 6-vs-9 gets ~0.82 instead of 0.67 — real crosswalks
+    # rarely have perfectly matching stripe counts on opposing sides.
     pin_count_consistency = 1.0
     if n_sides >= 4:
-        # Sort sides clockwise; opposing sides are 2 apart in the sorted ring.
         ring = sorted(sides, key=lambda s: s.bearing_deg)
         pairs = [(ring[0], ring[2])]
         if len(ring) >= 4:
@@ -195,11 +203,11 @@ def score_match(
         ratios = []
         for a, b in pairs:
             lo, hi = sorted([a.total_stripes, b.total_stripes])
-            ratios.append(lo / max(hi, 1))
+            ratios.append(math.sqrt(lo / max(hi, 1)))
         pin_count_consistency = sum(ratios) / len(ratios)
     elif n_sides == 2:
         lo, hi = sorted([sides[0].total_stripes, sides[1].total_stripes])
-        pin_count_consistency = lo / max(hi, 1)
+        pin_count_consistency = math.sqrt(lo / max(hi, 1))
 
     # --- body aspect ratio: distance between opposing sides; closer to 1.0 = square.
     body_aspect_ratio = 0.0

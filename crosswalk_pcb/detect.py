@@ -26,16 +26,35 @@ import numpy as np
 
 # ---------- thresholding ----------
 
-def find_paint_mask(image_bgr: np.ndarray, min_value: int = 190, max_sat: int = 80) -> np.ndarray:
-    """Return a uint8 mask of likely-paint pixels (bright + low saturation).
+def find_paint_mask(
+    image_bgr: np.ndarray,
+    min_value: int = 180,
+    max_sat_white: int = 80,
+    yellow_hue_lo: int = 15,
+    yellow_hue_hi: int = 35,
+    yellow_min_sat: int = 60,
+    yellow_min_val: int = 170,
+) -> np.ndarray:
+    """Return a uint8 mask of likely crosswalk-paint pixels.
 
-    Tuning notes: in shaded portions of an intersection paint will be dimmer;
-    too-low min_value picks up concrete/sand. Watch for false positives on
-    light-colored vehicle roofs (they're high-value too)."""
+    Detects both white paint (high value, low saturation) and yellow paint
+    (hue in the yellow band, moderate-to-high saturation, high value).
+    Many US cities (SF, NYC, etc.) use yellow for continental crosswalks.
+
+    OpenCV HSV ranges: H [0,180], S [0,255], V [0,255].
+    Yellow paint in aerial imagery typically lands at H ~20-30, S 80-200, V 170+.
+    """
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
-    return ((val >= min_value) & (sat <= max_sat)).astype(np.uint8) * 255
+    white_mask = (val >= min_value) & (sat <= max_sat_white)
+    yellow_mask = (
+        (hue >= yellow_hue_lo) & (hue <= yellow_hue_hi)
+        & (sat >= yellow_min_sat)
+        & (val >= yellow_min_val)
+    )
+    return ((white_mask | yellow_mask).astype(np.uint8) * 255)
 
 
 # ---------- stripe extraction ----------
@@ -51,17 +70,24 @@ class Stripe:
     contour: np.ndarray = field(repr=False)
 
 
-def _pca_oriented_box(pts: np.ndarray) -> tuple[float, float, float, float, float]:
-    """PCA of (N,2) pixel coords. Returns (cx, cy, angle_deg, len, width)."""
+def _pca_oriented_box(pts: np.ndarray) -> tuple[float, float, float, float, float] | None:
+    """PCA of (N,2) pixel coords. Returns (cx, cy, angle_deg, len, width)
+    or None for degenerate blobs (all collinear, singular covariance)."""
     mean = pts.mean(axis=0)
     centered = pts - mean
     cov = np.cov(centered.T)
+    if cov.ndim < 2 or not np.all(np.isfinite(cov)):
+        return None
     eigvals, eigvecs = np.linalg.eigh(cov)
+    if not np.all(np.isfinite(eigvecs)):
+        return None
     # eigh returns ascending eigenvalues -> long axis is the last column.
     long_axis = eigvecs[:, -1]
     # Project onto axes, compute spans.
     proj_long = centered @ long_axis
     proj_short = centered @ eigvecs[:, 0]
+    if not (np.all(np.isfinite(proj_long)) and np.all(np.isfinite(proj_short))):
+        return None
     length = proj_long.max() - proj_long.min()
     width = proj_short.max() - proj_short.min()
     # Note: pixel y grows downward, so angle math is in image coords. We use
@@ -102,7 +128,10 @@ def extract_stripes(
         if len(xs) < 6:
             continue
         pts = np.column_stack([xs, ys]).astype(np.float64)
-        cx, cy, angle, length, width = _pca_oriented_box(pts)
+        result = _pca_oriented_box(pts)
+        if result is None:
+            continue
+        cx, cy, angle, length, width = result
         if width < 1.0:
             continue
         aspect = length / max(width, 1e-6)
