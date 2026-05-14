@@ -33,7 +33,8 @@ from crosswalk_pcb.detect import (
     align_image_to_roads, build_road_mask, detect_stripes_periodic,
     draw_overlay, extract_stripes,
     find_paint_mask, find_paint_mask_adaptive, find_paint_mask_contrast,
-    find_paint_mask_ensemble, find_paint_mask_multithresh,
+    find_paint_mask_canny_lines, find_paint_mask_ensemble,
+    find_paint_mask_multithresh,
     find_paint_mask_tophat, find_paint_mask_tophat_adaptive,
     group_stripes_into_arrays,
 )
@@ -62,6 +63,16 @@ AREAS: dict[str, tuple[float, float, float, float]] = {
     # Detroit — grid is nearly N-S aligned
     "det-midtown":  (42.330, -83.055, 42.345, -83.040),  # Midtown Detroit
     "det-corktown": (42.325, -83.075, 42.340, -83.055),  # Corktown / Michigan Ave
+    # Chicago — grid-aligned downtown
+    "chi-loop":     (41.875, -87.640, 41.895, -87.620),
+    # Portland — grid-aligned downtown
+    "pdx-downtown": (45.510, -122.690, 45.530, -122.660),
+    # Washington DC — grid-aligned downtown
+    "dc-downtown":  (38.895, -77.040, 38.910, -77.020),
+    # Denver — grid-aligned downtown
+    "den-downtown": (39.740, -104.995, 39.755, -104.975),
+    # Minneapolis — grid-aligned downtown
+    "mpls-downtown": (44.970, -93.280, 44.985, -93.260),
 }
 
 
@@ -76,8 +87,9 @@ def main() -> int:
     ap.add_argument("--size", type=int, default=768)
     ap.add_argument("--detect", default="global",
                     choices=["global", "adaptive", "contrast", "periodic",
-                             "tophat", "tophat-adaptive", "multithresh",
-                             "ensemble", "multi"],
+                             "tophat", "tophat-small", "tophat-adaptive",
+                             "multithresh", "ensemble", "canny-lines",
+                             "multi"],
                     help="stripe detection method: global threshold, "
                          "adaptive local contrast, color-contrast "
                          "(paint-on-asphalt), periodic autocorrelation, "
@@ -186,12 +198,21 @@ def main() -> int:
                     mk = find_paint_mask_adaptive(bgr)
                 elif method == "tophat":
                     mk = find_paint_mask_tophat(bgr)
+                elif method == "tophat-small":
+                    # Small structuring element for bright concrete (Detroit).
+                    # Detects dark gaps between stripes rather than bright stripes.
+                    mk = find_paint_mask_tophat(
+                        bgr, stripe_width_px=4, element_scale=2.0,
+                        threshold_fraction=0.15, min_absolute_val=70,
+                    )
                 elif method == "tophat-adaptive":
                     mk = find_paint_mask_tophat_adaptive(bgr)
                 elif method == "multithresh":
                     mk = find_paint_mask_multithresh(bgr)
                 elif method == "ensemble":
                     mk = find_paint_mask_ensemble(bgr)
+                elif method == "canny-lines":
+                    mk = find_paint_mask_canny_lines(bgr)
                 else:
                     mk = find_paint_mask(bgr)
                 if road_mask is not None:
@@ -202,12 +223,21 @@ def main() -> int:
 
         try:
             if args.detect == "multi":
-                # Try multiple methods and keep the one with the most
-                # stripes in arrays (best detection).
-                methods = ["global", "adaptive", "tophat",
-                           "tophat-adaptive", "multithresh", "ensemble"]
+                # Try all detection methods and keep the one that produces
+                # the most stripes grouped into arrays (best detection).
+                # This is the best strategy since no single method wins
+                # everywhere: tophat beats bright-concrete, adaptive beats
+                # shadows, contrast handles varied backgrounds, etc.
+                methods = [
+                    "global", "adaptive", "contrast", "tophat",
+                    "tophat-small", "tophat-adaptive", "multithresh",
+                    "ensemble", "canny-lines",
+                ]
+                if bearings:
+                    methods.append("periodic")
                 best_arrays = []
                 best_stripes = []
+                best_method = ""
                 for method in methods:
                     try:
                         st, ar = _detect_with_method(method)
@@ -215,6 +245,7 @@ def main() -> int:
                         if total_in > sum(len(a.stripes) for a in best_arrays):
                             best_arrays = ar
                             best_stripes = st
+                            best_method = method
                     except Exception:
                         pass
                 stripes = best_stripes

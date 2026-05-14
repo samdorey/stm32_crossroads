@@ -185,15 +185,16 @@ def find_paint_mask_multithresh(
 
 def find_paint_mask_canny_lines(
     image_bgr: np.ndarray,
-    canny_lo: int = 40,
-    canny_hi: int = 120,
-    hough_threshold: int = 25,
-    min_line_length_px: int = 12,
-    max_line_gap_px: int = 10,
-    stripe_width_range_px: tuple[int, int] = (3, 18),
-    angle_tolerance_deg: float = 15.0,
-    min_pair_length_px: int = 15,
-    dilate_px: int = 2,
+    canny_lo: int = 30,
+    canny_hi: int = 100,
+    hough_threshold: int = 15,
+    min_line_length_px: int = 8,
+    max_line_gap_px: int = 12,
+    stripe_width_range_px: tuple[int, int] = (2, 22),
+    angle_tolerance_deg: float = 20.0,
+    min_pair_length_px: int = 8,
+    dilate_px: int = 3,
+    max_lines: int = 800,
 ) -> np.ndarray:
     """Edge-based stripe detection using Canny + Hough line segments.
 
@@ -224,6 +225,15 @@ def find_paint_mask_canny_lines(
     mid_x = (segments[:, 0] + segments[:, 2]) / 2.0
     mid_y = (segments[:, 1] + segments[:, 3]) / 2.0
 
+    # Cap the number of lines to keep the O(n^2) pairing tractable.
+    if len(segments) > max_lines:
+        # Keep the longest lines.
+        order = np.argsort(-lengths)[:max_lines]
+        segments = segments[order]
+        dx = dx[order]; dy = dy[order]
+        angles = angles[order]; lengths = lengths[order]
+        mid_x = mid_x[order]; mid_y = mid_y[order]
+
     mask = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
     n = len(segments)
     min_w, max_w = stripe_width_range_px
@@ -248,7 +258,9 @@ def find_paint_mask_canny_lines(
             if not (min_w <= perp_dist <= max_w):
                 continue
             along_dist = abs(float(dmid @ dirs[i]))
-            if along_dist > max(lengths[i], lengths[j]) * 0.7:
+            # Allow midpoints to be offset along the line direction
+            # up to the full length of the longer segment (not 0.7x).
+            if along_dist > max(lengths[i], lengths[j]) * 1.2:
                 continue
             # Draw a proper rotated rectangle centered between the pair.
             cx = (mid_x[i] + mid_x[j]) / 2.0
