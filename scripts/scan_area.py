@@ -33,6 +33,8 @@ from crosswalk_pcb.detect import (
     align_image_to_roads, build_road_mask, detect_stripes_periodic,
     draw_overlay, extract_stripes,
     find_paint_mask, find_paint_mask_adaptive, find_paint_mask_contrast,
+    find_paint_mask_ensemble, find_paint_mask_multithresh,
+    find_paint_mask_tophat, find_paint_mask_tophat_adaptive,
     group_stripes_into_arrays,
 )
 from crosswalk_pcb.imagery import SOURCES, fetch_centered, stable_intersection_id
@@ -73,10 +75,15 @@ def main() -> int:
     ap.add_argument("--zoom", type=int, default=19)
     ap.add_argument("--size", type=int, default=768)
     ap.add_argument("--detect", default="global",
-                    choices=["global", "adaptive", "contrast", "periodic"],
+                    choices=["global", "adaptive", "contrast", "periodic",
+                             "tophat", "tophat-adaptive", "multithresh",
+                             "ensemble", "multi"],
                     help="stripe detection method: global threshold, "
                          "adaptive local contrast, color-contrast "
-                         "(paint-on-asphalt), or periodic autocorrelation")
+                         "(paint-on-asphalt), periodic autocorrelation, "
+                         "tophat morphological, tophat-adaptive combined, "
+                         "multi-threshold, ensemble (voting), or "
+                         "multi (tries all methods per intersection)")
     ap.add_argument("--road-mask", action="store_true",
                     help="mask out non-road areas using OSM leg bearings "
                          "before detection (reduces false positives)")
@@ -165,23 +172,55 @@ def main() -> int:
                 margin_px=5.0 / res.m_per_px,             # ~5m margin
                 center_radius_px=20.0 / res.m_per_px,     # ~20m radius
             )
-        try:
-            if args.detect == "periodic":
-                stripes = detect_stripes_periodic(
+        def _detect_with_method(method: str) -> tuple:
+            """Run a single detection method, return (stripes, arrays)."""
+            if method == "periodic":
+                st = detect_stripes_periodic(
                     bgr, bearings, res.m_per_px, center,
                     road_mask=road_mask,
                 )
             else:
-                if args.detect == "contrast":
-                    mask = find_paint_mask_contrast(bgr)
-                elif args.detect == "adaptive":
-                    mask = find_paint_mask_adaptive(bgr)
+                if method == "contrast":
+                    mk = find_paint_mask_contrast(bgr)
+                elif method == "adaptive":
+                    mk = find_paint_mask_adaptive(bgr)
+                elif method == "tophat":
+                    mk = find_paint_mask_tophat(bgr)
+                elif method == "tophat-adaptive":
+                    mk = find_paint_mask_tophat_adaptive(bgr)
+                elif method == "multithresh":
+                    mk = find_paint_mask_multithresh(bgr)
+                elif method == "ensemble":
+                    mk = find_paint_mask_ensemble(bgr)
                 else:
-                    mask = find_paint_mask(bgr)
+                    mk = find_paint_mask(bgr)
                 if road_mask is not None:
-                    mask = cv2.bitwise_and(mask, road_mask)
-                stripes = extract_stripes(mask, m_per_px=res.m_per_px)
-            arrays = group_stripes_into_arrays(stripes)
+                    mk = cv2.bitwise_and(mk, road_mask)
+                st = extract_stripes(mk, m_per_px=res.m_per_px)
+            ar = group_stripes_into_arrays(st)
+            return st, ar
+
+        try:
+            if args.detect == "multi":
+                # Try multiple methods and keep the one with the most
+                # stripes in arrays (best detection).
+                methods = ["global", "adaptive", "tophat",
+                           "tophat-adaptive", "multithresh", "ensemble"]
+                best_arrays = []
+                best_stripes = []
+                for method in methods:
+                    try:
+                        st, ar = _detect_with_method(method)
+                        total_in = sum(len(a.stripes) for a in ar)
+                        if total_in > sum(len(a.stripes) for a in best_arrays):
+                            best_arrays = ar
+                            best_stripes = st
+                    except Exception:
+                        pass
+                stripes = best_stripes
+                arrays = best_arrays
+            else:
+                stripes, arrays = _detect_with_method(args.detect)
         except Exception:
             continue
         cw_counts = crosswalk_side_counts(arrays, center)

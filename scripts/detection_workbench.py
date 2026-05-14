@@ -29,7 +29,12 @@ from crosswalk_pcb.detect import (
     extract_stripes,
     find_paint_mask,
     find_paint_mask_adaptive,
+    find_paint_mask_canny_lines,
     find_paint_mask_contrast,
+    find_paint_mask_ensemble,
+    find_paint_mask_multithresh,
+    find_paint_mask_tophat,
+    find_paint_mask_tophat_adaptive,
     group_stripes_into_arrays,
 )
 from crosswalk_pcb.imagery import fetch_centered
@@ -139,6 +144,65 @@ CONFIGS = [
             "min_count": 2,
         },
     ),
+    DetectConfig(
+        name="tophat",
+        description="White top-hat (morphological, se=3x stripe width) + road mask",
+        mask_fn_name="tophat",
+        use_road_mask=True,
+    ),
+    DetectConfig(
+        name="tophat-small",
+        description="Top-hat with smaller SE (2x) for finer stripes + road mask",
+        mask_fn_name="tophat",
+        mask_kwargs={"element_scale": 2.0, "threshold_fraction": 0.2},
+        use_road_mask=True,
+    ),
+    DetectConfig(
+        name="tophat-adaptive",
+        description="Top-hat + adaptive threshold on response, road mask",
+        mask_fn_name="tophat-adaptive",
+        use_road_mask=True,
+    ),
+    DetectConfig(
+        name="tophat-adapt-loose",
+        description="Top-hat+adaptive, lower margin (15), road mask",
+        mask_fn_name="tophat-adaptive",
+        mask_kwargs={"brightness_margin": 15.0},
+        use_road_mask=True,
+    ),
+    DetectConfig(
+        name="multithresh",
+        description="Multi-threshold (140-200) with CC area filter + road mask",
+        mask_fn_name="multithresh",
+        use_road_mask=True,
+    ),
+    DetectConfig(
+        name="canny-lines",
+        description="Canny + Hough parallel line pairing + road mask",
+        mask_fn_name="canny-lines",
+        use_road_mask=True,
+    ),
+    DetectConfig(
+        name="canny-lines-wide",
+        description="Canny + Hough with wider stripe width (3-20px) + road mask",
+        mask_fn_name="canny-lines",
+        mask_kwargs={"stripe_width_range_px": (3, 20), "min_line_length_px": 12},
+        use_road_mask=True,
+    ),
+    DetectConfig(
+        name="ensemble-2of3",
+        description="Ensemble: global+adaptive+tophat, 2-of-3 voting + road mask",
+        mask_fn_name="ensemble",
+        mask_kwargs={"min_votes": 2},
+        use_road_mask=True,
+    ),
+    DetectConfig(
+        name="ensemble-1of3",
+        description="Ensemble: global+adaptive+tophat, 1-of-3 (union) + road mask",
+        mask_fn_name="ensemble",
+        mask_kwargs={"min_votes": 1},
+        use_road_mask=True,
+    ),
 ]
 
 
@@ -148,6 +212,11 @@ MASK_FNS = {
     "global": find_paint_mask,
     "adaptive": find_paint_mask_adaptive,
     "contrast": find_paint_mask_contrast,
+    "tophat": find_paint_mask_tophat,
+    "tophat-adaptive": find_paint_mask_tophat_adaptive,
+    "multithresh": find_paint_mask_multithresh,
+    "canny-lines": find_paint_mask_canny_lines,
+    "ensemble": find_paint_mask_ensemble,
 }
 
 

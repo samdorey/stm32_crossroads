@@ -57,6 +57,315 @@ def find_paint_mask(
     return ((white_mask | yellow_mask).astype(np.uint8) * 255)
 
 
+def find_paint_mask_tophat(
+    image_bgr: np.ndarray,
+    stripe_width_px: int = 8,
+    element_scale: float = 3.0,
+    threshold_fraction: float = 0.25,
+    max_sat_white: int = 120,
+    yellow_hue_lo: int = 12,
+    yellow_hue_hi: int = 38,
+    yellow_min_sat: int = 35,
+    min_absolute_val: int = 90,
+) -> np.ndarray:
+    """White top-hat paint mask.
+
+    The white top-hat (morphological opening subtracted from original)
+    extracts bright features *smaller* than the structuring element.
+    Crosswalk stripes (width ~0.5m = ~4-8px at zoom 19) are extracted
+    while large bright areas (concrete, rooftops) are suppressed.
+
+    The structuring element is an ellipse whose minor axis is
+    stripe_width_px * element_scale. This lets stripe-sized bright
+    features through while rejecting anything wider.
+
+    After top-hat, we threshold at a fraction of the local max response,
+    combined with a color filter (white or yellow paint).
+
+    This is the key advantage over global thresholds: concrete that is
+    uniformly bright produces near-zero top-hat response, while paint
+    stripes (bright on dark) produce a strong response."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    gray = val.astype(np.float32)
+
+    # Structuring element: must be larger than stripe width to preserve them.
+    se_size = max(3, int(stripe_width_px * element_scale)) | 1  # ensure odd
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (se_size, se_size))
+
+    # White top-hat: original - opening.  Extracts bright features < se.
+    tophat = cv2.morphologyEx(gray.astype(np.uint8), cv2.MORPH_TOPHAT, se)
+
+    # Threshold: pixels where the top-hat response exceeds a fraction of
+    # the local maximum.  Use a large blur to estimate local max.
+    if tophat.max() == 0:
+        return np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    # Adaptive threshold: compare to a large local max.
+    blur_size = se_size * 5 | 1
+    local_max = cv2.dilate(tophat, np.ones((blur_size, blur_size), np.uint8))
+    local_max = cv2.GaussianBlur(local_max.astype(np.float32),
+                                 (blur_size, blur_size), 0)
+    local_max = np.maximum(local_max, 1.0)
+
+    # Simple threshold on tophat value.
+    th_val = max(10, int(tophat.max() * threshold_fraction))
+    bright = tophat >= th_val
+
+    # Also require minimum absolute brightness.
+    bright = bright & (val >= min_absolute_val)
+
+    # Color filter: white or yellow.
+    white = sat <= max_sat_white
+    yellow = (
+        (hue >= yellow_hue_lo) & (hue <= yellow_hue_hi)
+        & (sat >= yellow_min_sat)
+    )
+    return ((bright & (white | yellow)).astype(np.uint8) * 255)
+
+
+def find_paint_mask_multithresh(
+    image_bgr: np.ndarray,
+    thresholds: tuple[int, ...] = (140, 160, 180, 200),
+    max_sat_white: int = 100,
+    yellow_hue_lo: int = 12,
+    yellow_hue_hi: int = 38,
+    yellow_min_sat: int = 40,
+    min_stripe_area_px: int = 30,
+    max_stripe_area_px: int = 2000,
+) -> np.ndarray:
+    """Multi-threshold paint mask with connected-component filtering.
+
+    Runs the global threshold at multiple brightness levels and keeps
+    components that appear as stripe-shaped at ANY threshold level.
+    This handles shadows (lower threshold captures dim paint) and bright
+    concrete (higher thresholds filter out diffuse brightness -- only
+    compact bright features survive the area filter).
+
+    The key insight: at V=140, shadowed paint appears but so does some
+    concrete; at V=200, only the brightest paint survives. A stripe-shaped
+    component at any level is likely paint."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    # Color filter.
+    white = sat <= max_sat_white
+    yellow = (
+        (hue >= yellow_hue_lo) & (hue <= yellow_hue_hi)
+        & (sat >= yellow_min_sat)
+    )
+    color_ok = white | yellow
+
+    combined = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    for thresh in thresholds:
+        mask = ((val >= thresh) & color_ok).astype(np.uint8) * 255
+        # Morphological cleanup.
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        # Keep only stripe-sized components.
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=8)
+        for lbl in range(1, n_labels):
+            area = stats[lbl, cv2.CC_STAT_AREA]
+            w = stats[lbl, cv2.CC_STAT_WIDTH]
+            h = stats[lbl, cv2.CC_STAT_HEIGHT]
+            aspect = max(w, h) / max(min(w, h), 1)
+            if min_stripe_area_px <= area <= max_stripe_area_px and aspect >= 2.0:
+                combined[labels == lbl] = 255
+
+    return combined
+
+
+def find_paint_mask_canny_lines(
+    image_bgr: np.ndarray,
+    canny_lo: int = 40,
+    canny_hi: int = 120,
+    hough_threshold: int = 25,
+    min_line_length_px: int = 12,
+    max_line_gap_px: int = 10,
+    stripe_width_range_px: tuple[int, int] = (3, 18),
+    angle_tolerance_deg: float = 15.0,
+    min_pair_length_px: int = 15,
+    dilate_px: int = 2,
+) -> np.ndarray:
+    """Edge-based stripe detection using Canny + Hough line segments.
+
+    Detects edges, finds line segments, then pairs parallel segments that
+    are stripe-width apart. For each valid pair, draws a filled rotated
+    rectangle (proper stripe shape) between the two line midpoints.
+
+    Then dilates the result to create connected blobs suitable for
+    the connected-component extraction pipeline."""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(gray, canny_lo, canny_hi)
+
+    lines = cv2.HoughLinesP(
+        edges, rho=1, theta=np.pi / 180,
+        threshold=hough_threshold,
+        minLineLength=min_line_length_px,
+        maxLineGap=max_line_gap_px,
+    )
+    if lines is None:
+        return np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    segments = lines.reshape(-1, 4)
+    dx = (segments[:, 2] - segments[:, 0]).astype(np.float64)
+    dy = (segments[:, 3] - segments[:, 1]).astype(np.float64)
+    angles = np.degrees(np.arctan2(dy, dx))
+    lengths = np.sqrt(dx**2 + dy**2)
+    mid_x = (segments[:, 0] + segments[:, 2]) / 2.0
+    mid_y = (segments[:, 1] + segments[:, 3]) / 2.0
+
+    mask = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+    n = len(segments)
+    min_w, max_w = stripe_width_range_px
+
+    norms = np.column_stack([-dy, dx])
+    safe_lengths = np.maximum(lengths, 1e-6)
+    norms = norms / safe_lengths[:, None]
+    dirs = np.column_stack([dx, dy]) / safe_lengths[:, None]
+
+    for i in range(n):
+        if lengths[i] < min_pair_length_px:
+            continue
+        for j in range(i + 1, n):
+            if lengths[j] < min_pair_length_px:
+                continue
+            adiff = abs(angles[i] - angles[j]) % 180
+            adiff = min(adiff, 180 - adiff)
+            if adiff > angle_tolerance_deg:
+                continue
+            dmid = np.array([mid_x[j] - mid_x[i], mid_y[j] - mid_y[i]])
+            perp_dist = abs(float(dmid @ norms[i]))
+            if not (min_w <= perp_dist <= max_w):
+                continue
+            along_dist = abs(float(dmid @ dirs[i]))
+            if along_dist > max(lengths[i], lengths[j]) * 0.7:
+                continue
+            # Draw a proper rotated rectangle centered between the pair.
+            cx = (mid_x[i] + mid_x[j]) / 2.0
+            cy = (mid_y[i] + mid_y[j]) / 2.0
+            avg_len = (lengths[i] + lengths[j]) / 2.0
+            avg_angle = angles[i]  # use one line's angle
+            cos_a = math.cos(math.radians(avg_angle))
+            sin_a = math.sin(math.radians(avg_angle))
+            u = np.array([cos_a, sin_a])
+            v = np.array([-sin_a, cos_a])
+            c = np.array([cx, cy])
+            hl, hw = avg_len / 2, perp_dist / 2
+            corners = np.array([
+                c + hl * u + hw * v,
+                c - hl * u + hw * v,
+                c - hl * u - hw * v,
+                c + hl * u - hw * v,
+            ], dtype=np.int32)
+            cv2.fillPoly(mask, [corners], 255)
+
+    if dilate_px > 0:
+        k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+        mask = cv2.dilate(mask, k)
+
+    return mask
+
+
+def find_paint_mask_ensemble(
+    image_bgr: np.ndarray,
+    use_tophat: bool = True,
+    use_adaptive: bool = True,
+    use_global: bool = True,
+    min_votes: int = 2,
+    tophat_kwargs: dict | None = None,
+    adaptive_kwargs: dict | None = None,
+    global_kwargs: dict | None = None,
+) -> np.ndarray:
+    """Ensemble paint mask: combine multiple detection methods via voting.
+
+    A pixel is marked as paint if at least min_votes methods agree.
+    This is robust because each method has different failure modes:
+    - Global fails on bright concrete (false positives)
+    - Adaptive fails on very uniform areas
+    - Top-hat naturally rejects large bright areas
+
+    With min_votes=2, a pixel needs agreement from 2/3 methods."""
+    votes = np.zeros(image_bgr.shape[:2], dtype=np.int32)
+
+    if use_global:
+        kw = global_kwargs or {}
+        m = find_paint_mask(image_bgr, **kw)
+        votes += (m > 0).astype(np.int32)
+
+    if use_adaptive:
+        kw = adaptive_kwargs or {}
+        m = find_paint_mask_adaptive(image_bgr, **kw)
+        votes += (m > 0).astype(np.int32)
+
+    if use_tophat:
+        kw = tophat_kwargs or {}
+        m = find_paint_mask_tophat(image_bgr, **kw)
+        votes += (m > 0).astype(np.int32)
+
+    return ((votes >= min_votes).astype(np.uint8) * 255)
+
+
+def find_paint_mask_tophat_adaptive(
+    image_bgr: np.ndarray,
+    stripe_width_px: int = 8,
+    element_scale: float = 3.0,
+    brightness_margin: float = 20.0,
+    min_absolute_val: int = 90,
+    max_sat_white: int = 120,
+    yellow_hue_lo: int = 12,
+    yellow_hue_hi: int = 38,
+    yellow_min_sat: int = 35,
+) -> np.ndarray:
+    """Combined top-hat + adaptive local contrast.
+
+    Uses top-hat to extract features smaller than the structuring element,
+    THEN applies adaptive thresholding on the top-hat response itself.
+    This double filtering:
+    1. Top-hat removes large bright areas (concrete, rooftops)
+    2. Adaptive threshold on top-hat adapts to local response intensity
+
+    This is the most robust combination: concrete gives near-zero top-hat,
+    while paint stripes give strong top-hat. Even in shadow, the relative
+    brightness difference (paint vs asphalt) produces top-hat response."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    # Top-hat to extract small bright features.
+    se_size = max(3, int(stripe_width_px * element_scale)) | 1
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (se_size, se_size))
+    tophat = cv2.morphologyEx(val, cv2.MORPH_TOPHAT, se)
+
+    # Adaptive threshold on the top-hat response.
+    tophat_f = tophat.astype(np.float32)
+    block = se_size * 5 | 1
+    local_mean = cv2.GaussianBlur(tophat_f, (block, block), 0)
+    bright = tophat_f > (local_mean + brightness_margin)
+
+    # Absolute brightness floor.
+    bright = bright & (val >= min_absolute_val)
+
+    # Color filter.
+    white = sat <= max_sat_white
+    yellow = (
+        (hue >= yellow_hue_lo) & (hue <= yellow_hue_hi)
+        & (sat >= yellow_min_sat)
+    )
+    return ((bright & (white | yellow)).astype(np.uint8) * 255)
+
+
 def find_paint_mask_adaptive(
     image_bgr: np.ndarray,
     block_size: int = 51,
