@@ -30,14 +30,15 @@ from crosswalk_pcb.cache import (
     progress_summary, save_cache, CACHE_PATH,
 )
 from crosswalk_pcb.detect import (
-    align_image_to_roads, draw_overlay, extract_stripes,
-    find_paint_mask, group_stripes_into_arrays,
+    align_image_to_roads, build_road_mask, detect_stripes_periodic,
+    draw_overlay, extract_stripes,
+    find_paint_mask, find_paint_mask_adaptive, group_stripes_into_arrays,
 )
 from crosswalk_pcb.imagery import SOURCES, fetch_centered, stable_intersection_id
 from crosswalk_pcb.kicad import load_library
 from crosswalk_pcb.match import (
     crosswalk_side_counts, find_exact_matches, footprint_side_counts,
-    render_comparison, _rotate_counts,
+    render_aligned_comparison, _rotate_counts,
 )
 from crosswalk_pcb.osm import build_query, extract_junctions, rank_candidates, run_overpass
 
@@ -60,6 +61,13 @@ def main() -> int:
     ap.add_argument("--source", default="mapbox_satellite")
     ap.add_argument("--zoom", type=int, default=19)
     ap.add_argument("--size", type=int, default=768)
+    ap.add_argument("--detect", default="global",
+                    choices=["global", "adaptive", "periodic"],
+                    help="stripe detection method: global threshold, "
+                         "adaptive local contrast, or periodic autocorrelation")
+    ap.add_argument("--road-mask", action="store_true",
+                    help="mask out non-road areas using OSM leg bearings "
+                         "before detection (reduces false positives)")
     ap.add_argument("--status", action="store_true",
                     help="just print progress and unmatched footprints, then exit")
     ap.add_argument("--cache", default=str(CACHE_PATH))
@@ -134,19 +142,41 @@ def main() -> int:
         bearings = [float(b) for b in cand.leg_bearings]
         if bearings:
             bgr, _ = align_image_to_roads(bgr, bearings)
+        aerial_bgr = bgr.copy()
+        center = (bgr.shape[1] / 2, bgr.shape[0] / 2)
+        road_mask = None
+        if args.road_mask and bearings:
+            road_mask = build_road_mask(
+                bgr.shape, bearings, center,
+                road_half_width_px=80.0 / res.m_per_px * 0.12,  # ~10m
+                length_px=bgr.shape[0] * 0.45,
+                margin_px=30.0 / res.m_per_px * 0.12,  # ~3.6m
+            )
         try:
-            mask = find_paint_mask(bgr)
-            stripes = extract_stripes(mask, m_per_px=res.m_per_px)
+            if args.detect == "periodic":
+                stripes = detect_stripes_periodic(
+                    bgr, bearings, res.m_per_px, center,
+                    road_mask=road_mask,
+                )
+            else:
+                if args.detect == "adaptive":
+                    mask = find_paint_mask_adaptive(bgr)
+                else:
+                    mask = find_paint_mask(bgr)
+                if road_mask is not None:
+                    mask = cv2.bitwise_and(mask, road_mask)
+                stripes = extract_stripes(mask, m_per_px=res.m_per_px)
             arrays = group_stripes_into_arrays(stripes)
         except Exception:
             continue
-        center = (bgr.shape[1] / 2, bgr.shape[0] / 2)
         cw_counts = crosswalk_side_counts(arrays, center)
 
         # Quick check: does this count pattern match anything we still need?
         if cw_counts not in needed_patterns:
             continue
 
+        all_stripes = [s for a in arrays for s in a.stripes]
+        det_overlay = draw_overlay(aerial_bgr, arrays)
         matches = find_exact_matches(arrays, center, lib)
         for m in matches:
             if m.footprint_name in already_matched:
@@ -155,10 +185,16 @@ def main() -> int:
                       lat, lon, cw_counts, label, m.iou, m.rotation_k)
             already_matched.add(m.footprint_name)
             new_matches += 1
-            # Save comparison image.
-            comp = render_comparison(m)
-            safe_name = m.footprint_name.replace("/", "_").replace(" ", "_")
-            cv2.imwrite(str(out_dir / f"{safe_name}.png"), comp)
+            # Save 5-panel comparison image.
+            fp = next(f for f in lib if f.name == m.footprint_name)
+            comp = render_aligned_comparison(
+                fp, all_stripes, center, m.rotation_k,
+                aerial_bgr=aerial_bgr,
+                detection_overlay_bgr=det_overlay,
+            )
+            if comp is not None:
+                safe_name = m.footprint_name.replace("/", "_").replace(" ", "_")
+                cv2.imwrite(str(out_dir / f"{safe_name}.png"), comp)
             print(f"  NEW: {m.footprint_name}  pads={m.fp_counts}  "
                   f"cw={cw_counts}  IoU={m.iou:.3f}  ({lat:.5f},{lon:.5f})")
 

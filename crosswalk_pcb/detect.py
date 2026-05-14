@@ -57,6 +57,203 @@ def find_paint_mask(
     return ((white_mask | yellow_mask).astype(np.uint8) * 255)
 
 
+def find_paint_mask_adaptive(
+    image_bgr: np.ndarray,
+    block_size: int = 51,
+    brightness_margin: float = 25.0,
+    max_sat_white: int = 120,
+    yellow_hue_lo: int = 12,
+    yellow_hue_hi: int = 38,
+    yellow_min_sat: int = 40,
+) -> np.ndarray:
+    """Local-contrast paint mask. A pixel is "paint" if it is brighter than
+    its local neighborhood by at least `brightness_margin` AND has a
+    paint-like color (white or yellow).
+
+    Handles shadows: a stripe in shadow at V=130 on asphalt at V=100 still
+    has a +30 local contrast, so it passes. The global method would miss it
+    because V=130 < 180.
+
+    block_size must be odd; controls the neighborhood radius (~6m at 0.12 m/px
+    with block_size=51)."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2].astype(np.float32)
+    # Local mean brightness.
+    local_mean = cv2.GaussianBlur(val, (block_size, block_size), 0)
+    bright_relative = (val - local_mean) > brightness_margin
+    # Color check — slightly relaxed thresholds since shadow paint is dimmer.
+    white = sat <= max_sat_white
+    yellow = (
+        (hue >= yellow_hue_lo) & (hue <= yellow_hue_hi)
+        & (sat >= yellow_min_sat)
+    )
+    return ((bright_relative & (white | yellow)).astype(np.uint8) * 255)
+
+
+# ---------- road mask ----------
+
+def build_road_mask(
+    image_shape: tuple[int, ...],
+    leg_bearings_deg: list[float],
+    center_px: tuple[float, float],
+    road_half_width_px: float = 80.0,
+    length_px: float = 400.0,
+    margin_px: float = 30.0,
+) -> np.ndarray:
+    """Build a binary mask of the road corridors radiating from the
+    intersection center. Uses OSM leg bearings to draw thick lines
+    outward from center.
+
+    road_half_width_px + margin_px determines how wide the mask is on
+    each side of the road centerline. At 0.12 m/px, 80px ≈ 10m which
+    covers a typical 2-lane road with some buffer."""
+    mask = np.zeros(image_shape[:2], dtype=np.uint8)
+    thickness = int(2 * (road_half_width_px + margin_px))
+    cx, cy = int(center_px[0]), int(center_px[1])
+    for bearing in leg_bearings_deg:
+        angle_rad = math.radians(bearing)
+        dx = math.sin(angle_rad) * length_px
+        dy = -math.cos(angle_rad) * length_px
+        end = (int(cx + dx), int(cy + dy))
+        cv2.line(mask, (cx, cy), end, 255, thickness)
+    return mask
+
+
+# ---------- periodic stripe detection ----------
+
+def detect_stripes_periodic(
+    image_bgr: np.ndarray,
+    leg_bearings_deg: list[float],
+    m_per_px: float,
+    center_px: tuple[float, float],
+    road_mask: np.ndarray | None = None,
+    min_pitch_m: float = 0.8,
+    max_pitch_m: float = 2.0,
+    stripe_width_m: float = 0.6,
+    search_depth_m: float = 5.0,
+    search_width_m: float = 8.0,
+    min_stripes: int = 3,
+    min_peak_strength: float = 0.15,
+) -> list:
+    """Detect crosswalk stripes by looking for periodic bright/dark patterns
+    along each road leg.
+
+    For each leg bearing, samples a strip of pixels in the road direction
+    at the expected crosswalk location, computes the autocorrelation, and
+    extracts stripe positions from periodic peaks.
+
+    Returns a list of Stripe objects (same as extract_stripes)."""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    h, w = gray.shape
+    cx, cy = center_px
+    min_pitch_px = min_pitch_m / m_per_px
+    max_pitch_px = max_pitch_m / m_per_px
+    search_depth_px = search_depth_m / m_per_px
+    search_width_px = search_width_m / m_per_px
+    stripe_width_px = stripe_width_m / m_per_px
+
+    all_stripes: list[Stripe] = []
+
+    for bearing in leg_bearings_deg:
+        angle_rad = math.radians(bearing)
+        # Road direction unit vector (from center outward).
+        road_dx = math.sin(angle_rad)
+        road_dy = -math.cos(angle_rad)
+        # Perpendicular (along-crosswalk) unit vector.
+        perp_dx = road_dy
+        perp_dy = -road_dx
+
+        # Sample a rectangular strip at the expected crosswalk location.
+        # The strip is centered at (center + search_depth along road),
+        # oriented along the perpendicular direction.
+        strip_center_x = cx + road_dx * search_depth_px
+        strip_center_y = cy + road_dy * search_depth_px
+
+        # Sample along the perpendicular at multiple offsets along the road
+        # direction, then average. This gives a 1D brightness profile.
+        n_perp = int(search_width_px)
+        n_road = max(3, int(stripe_width_px * 0.5))  # average over a few road-direction pixels
+        profile = np.zeros(n_perp, dtype=np.float32)
+        count = 0
+        for rd in range(-n_road // 2, n_road // 2 + 1):
+            for i in range(n_perp):
+                t = i - n_perp / 2
+                px = int(strip_center_x + perp_dx * t + road_dx * rd)
+                py = int(strip_center_y + perp_dy * t + road_dy * rd)
+                if 0 <= px < w and 0 <= py < h:
+                    if road_mask is None or road_mask[py, px] > 0:
+                        profile[i] += gray[py, px]
+                        count += 1
+            count = max(count, 1)  # avoid div by zero in sparse areas
+        profile /= max(n_road, 1)
+
+        if len(profile) < int(min_pitch_px * 3):
+            continue
+
+        # Remove DC / low-frequency trend.
+        kernel = int(max_pitch_px * 2) | 1  # ensure odd
+        if kernel < len(profile):
+            baseline = cv2.GaussianBlur(profile.reshape(1, -1), (kernel, 1), 0).flatten()
+            profile_hp = profile - baseline
+        else:
+            profile_hp = profile - profile.mean()
+
+        # Autocorrelation.
+        n = len(profile_hp)
+        autocorr = np.correlate(profile_hp, profile_hp, mode="full")
+        autocorr = autocorr[n - 1:]  # keep non-negative lags only
+        if autocorr[0] > 0:
+            autocorr /= autocorr[0]
+
+        # Find peaks in autocorrelation at valid pitch range.
+        lo = int(min_pitch_px)
+        hi = min(int(max_pitch_px), len(autocorr) - 1)
+        if lo >= hi:
+            continue
+        peak_region = autocorr[lo:hi + 1]
+        if len(peak_region) == 0 or peak_region.max() < min_peak_strength:
+            continue
+        best_lag = lo + int(np.argmax(peak_region))
+
+        # Found a periodic signal. Now extract individual stripe positions
+        # by finding local maxima in the high-pass profile at ~best_lag spacing.
+        # Use a simple peak finder: local max within half-pitch windows.
+        half_lag = best_lag // 2
+        peaks: list[int] = []
+        for start in range(0, n - half_lag, best_lag):
+            window = profile_hp[start:start + best_lag]
+            if len(window) == 0:
+                continue
+            local_max_idx = start + int(np.argmax(window))
+            if profile_hp[local_max_idx] > profile_hp.std() * 0.3:
+                peaks.append(local_max_idx)
+
+        if len(peaks) < min_stripes:
+            continue
+
+        # Convert peak positions to image coordinates.
+        for pk in peaks:
+            t = pk - n_perp / 2
+            sx = strip_center_x + perp_dx * t
+            sy = strip_center_y + perp_dy * t
+            # Stripe is oriented along the road direction (perpendicular to
+            # the crosswalk array direction).
+            stripe_angle = math.degrees(math.atan2(road_dy, road_dx))
+            stripe_length_px = search_depth_px * 0.6  # approximate
+            all_stripes.append(Stripe(
+                cx=sx, cy=sy,
+                angle_deg=stripe_angle,
+                length_px=stripe_length_px,
+                width_px=stripe_width_px,
+                area_px=int(stripe_length_px * stripe_width_px),
+                contour=np.array([[int(sx), int(sy)]], dtype=np.int32),
+            ))
+
+    return all_stripes
+
+
 # ---------- image alignment ----------
 
 def align_image_to_roads(
