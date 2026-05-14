@@ -223,33 +223,58 @@ def main() -> int:
 
         try:
             if args.detect == "multi":
-                # Try all detection methods and keep the one that produces
-                # the most stripes grouped into arrays (best detection).
-                # This is the best strategy since no single method wins
-                # everywhere: tophat beats bright-concrete, adaptive beats
-                # shadows, contrast handles varied backgrounds, etc.
+                # Try each detection method independently. For each, check
+                # if its counts match any needed footprint and if so, run
+                # the full exact match pipeline. This avoids the "most
+                # stripes" heuristic which often picks a noisy method over
+                # the one that produces the right counts.
                 methods = [
-                    "global", "adaptive", "contrast", "tophat",
-                    "tophat-small", "tophat-adaptive", "multithresh",
-                    "ensemble", "canny-lines",
+                    "global", "adaptive", "tophat", "tophat-small",
+                    "tophat-adaptive", "multithresh", "ensemble",
                 ]
-                if bearings:
-                    methods.append("periodic")
-                best_arrays = []
-                best_stripes = []
-                best_method = ""
+                found_any = False
                 for method in methods:
                     try:
                         st, ar = _detect_with_method(method)
-                        total_in = sum(len(a.stripes) for a in ar)
-                        if total_in > sum(len(a.stripes) for a in best_arrays):
-                            best_arrays = ar
-                            best_stripes = st
-                            best_method = method
                     except Exception:
-                        pass
-                stripes = best_stripes
-                arrays = best_arrays
+                        continue
+                    c_counts = crosswalk_side_counts(ar, center)
+                    if c_counts not in needed_patterns:
+                        continue
+                    a_stripes = [s for a2 in ar for s in a2.stripes]
+                    det_ov = draw_overlay(aerial_bgr, ar)
+                    m_results = find_exact_matches(ar, center, lib)
+                    for m in m_results:
+                        if m.footprint_name in already_matched:
+                            continue
+                        add_match(cache, m.footprint_name, m.fp_counts,
+                                  lat, lon, c_counts, label, m.iou,
+                                  m.rotation_k)
+                        already_matched.add(m.footprint_name)
+                        new_matches += 1
+                        fp = next(f for f in lib if f.name == m.footprint_name)
+                        comp = render_aligned_comparison(
+                            fp, a_stripes, center, m.rotation_k,
+                            aerial_bgr=aerial_bgr,
+                            detection_overlay_bgr=det_ov,
+                        )
+                        if comp is not None:
+                            safe_name = m.footprint_name.replace("/", "_").replace(" ", "_")
+                            cv2.imwrite(str(out_dir / f"{safe_name}.png"), comp)
+                        print(f"  NEW [{method}]: {m.footprint_name}  pads={m.fp_counts}  "
+                              f"cw={c_counts}  IoU={m.iou:.3f}  ({lat:.5f},{lon:.5f})")
+                        found_any = True
+                # Update needed_patterns after processing all methods.
+                needed_patterns = set()
+                for fp in lib:
+                    if fp.name in already_matched:
+                        continue
+                    c = footprint_side_counts(fp)
+                    for k in range(4):
+                        needed_patterns.add(_rotate_counts(c, k))
+                if found_any:
+                    save_cache(cache, cache_path)
+                continue  # skip the non-multi path below
             else:
                 stripes, arrays = _detect_with_method(args.detect)
         except Exception:
