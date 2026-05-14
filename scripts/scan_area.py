@@ -32,7 +32,8 @@ from crosswalk_pcb.cache import (
 from crosswalk_pcb.detect import (
     align_image_to_roads, build_road_mask, detect_stripes_periodic,
     draw_overlay, extract_stripes,
-    find_paint_mask, find_paint_mask_adaptive, group_stripes_into_arrays,
+    find_paint_mask, find_paint_mask_adaptive, find_paint_mask_contrast,
+    group_stripes_into_arrays,
 )
 from crosswalk_pcb.imagery import SOURCES, fetch_centered, stable_intersection_id
 from crosswalk_pcb.kicad import load_library
@@ -62,9 +63,10 @@ def main() -> int:
     ap.add_argument("--zoom", type=int, default=19)
     ap.add_argument("--size", type=int, default=768)
     ap.add_argument("--detect", default="global",
-                    choices=["global", "adaptive", "periodic"],
+                    choices=["global", "adaptive", "contrast", "periodic"],
                     help="stripe detection method: global threshold, "
-                         "adaptive local contrast, or periodic autocorrelation")
+                         "adaptive local contrast, color-contrast "
+                         "(paint-on-asphalt), or periodic autocorrelation")
     ap.add_argument("--road-mask", action="store_true",
                     help="mask out non-road areas using OSM leg bearings "
                          "before detection (reduces false positives)")
@@ -148,9 +150,10 @@ def main() -> int:
         if args.road_mask and bearings:
             road_mask = build_road_mask(
                 bgr.shape, bearings, center,
-                road_half_width_px=80.0 / res.m_per_px * 0.12,  # ~10m
+                road_half_width_px=12.0 / res.m_per_px,   # ~12m half-width
                 length_px=bgr.shape[0] * 0.45,
-                margin_px=30.0 / res.m_per_px * 0.12,  # ~3.6m
+                margin_px=5.0 / res.m_per_px,             # ~5m margin
+                center_radius_px=20.0 / res.m_per_px,     # ~20m radius
             )
         try:
             if args.detect == "periodic":
@@ -159,7 +162,9 @@ def main() -> int:
                     road_mask=road_mask,
                 )
             else:
-                if args.detect == "adaptive":
+                if args.detect == "contrast":
+                    mask = find_paint_mask_contrast(bgr)
+                elif args.detect == "adaptive":
                     mask = find_paint_mask_adaptive(bgr)
                 else:
                     mask = find_paint_mask(bgr)

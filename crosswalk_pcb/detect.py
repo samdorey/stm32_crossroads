@@ -60,19 +60,21 @@ def find_paint_mask(
 def find_paint_mask_adaptive(
     image_bgr: np.ndarray,
     block_size: int = 51,
-    brightness_margin: float = 25.0,
+    brightness_margin: float = 30.0,
+    min_absolute_val: int = 100,
     max_sat_white: int = 120,
     yellow_hue_lo: int = 12,
     yellow_hue_hi: int = 38,
     yellow_min_sat: int = 40,
 ) -> np.ndarray:
-    """Local-contrast paint mask. A pixel is "paint" if it is brighter than
-    its local neighborhood by at least `brightness_margin` AND has a
-    paint-like color (white or yellow).
+    """Local-contrast paint mask. A pixel is "paint" if:
+      1. It is brighter than its local neighborhood by brightness_margin, AND
+      2. Its absolute brightness is above min_absolute_val (rejects dark
+         edges like tree shadows that are locally bright), AND
+      3. It has a paint-like color (white or yellow).
 
     Handles shadows: a stripe in shadow at V=130 on asphalt at V=100 still
-    has a +30 local contrast, so it passes. The global method would miss it
-    because V=130 < 180.
+    has +30 local contrast and V>90, so it passes.
 
     block_size must be odd; controls the neighborhood radius (~6m at 0.12 m/px
     with block_size=51)."""
@@ -83,13 +85,63 @@ def find_paint_mask_adaptive(
     # Local mean brightness.
     local_mean = cv2.GaussianBlur(val, (block_size, block_size), 0)
     bright_relative = (val - local_mean) > brightness_margin
+    bright_absolute = val >= min_absolute_val
     # Color check — slightly relaxed thresholds since shadow paint is dimmer.
     white = sat <= max_sat_white
     yellow = (
         (hue >= yellow_hue_lo) & (hue <= yellow_hue_hi)
         & (sat >= yellow_min_sat)
     )
-    return ((bright_relative & (white | yellow)).astype(np.uint8) * 255)
+    return ((bright_relative & bright_absolute & (white | yellow)).astype(np.uint8) * 255)
+
+
+def find_paint_mask_contrast(
+    image_bgr: np.ndarray,
+    neighborhood_size: int = 31,
+    min_asphalt_frac: float = 0.35,
+    asphalt_max_val: int = 160,
+    asphalt_max_sat: int = 70,
+    paint_min_val: int = 110,
+    paint_max_sat_white: int = 120,
+    yellow_hue_lo: int = 12,
+    yellow_hue_hi: int = 38,
+    yellow_min_sat: int = 35,
+) -> np.ndarray:
+    """Color-contrast paint mask. A pixel is "stripe" if:
+      1. It is paint-colored (white or yellow), AND
+      2. Its local neighborhood is predominantly asphalt.
+
+    This is robust to shadows (asphalt stays dark+neutral even in shadow,
+    paint stays relatively bright+neutral) and rejects rooftops/cars
+    (their neighborhoods aren't asphalt).
+
+    neighborhood_size controls the kernel radius for the asphalt fraction
+    computation (~4m at 0.12 m/px with size=31)."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    # Asphalt: dark-to-medium brightness, low saturation, any hue.
+    asphalt = (val <= asphalt_max_val) & (sat <= asphalt_max_sat)
+
+    # Local asphalt fraction: what fraction of the neighborhood is asphalt?
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (neighborhood_size, neighborhood_size))
+    kernel_norm = kernel.astype(np.float32) / kernel.sum()
+    local_asphalt = cv2.filter2D(asphalt.astype(np.float32), -1, kernel_norm)
+    on_road = local_asphalt >= min_asphalt_frac
+
+    # Paint: white or yellow (relaxed — shadow paint can be V=110+).
+    white = (val >= paint_min_val) & (sat <= paint_max_sat_white)
+    yellow = (
+        (hue >= yellow_hue_lo) & (hue <= yellow_hue_hi)
+        & (sat >= yellow_min_sat)
+        & (val >= paint_min_val)
+    )
+    paint = white | yellow
+
+    return ((paint & on_road).astype(np.uint8) * 255)
 
 
 # ---------- road mask ----------
@@ -98,20 +150,23 @@ def build_road_mask(
     image_shape: tuple[int, ...],
     leg_bearings_deg: list[float],
     center_px: tuple[float, float],
-    road_half_width_px: float = 80.0,
+    road_half_width_px: float = 100.0,
     length_px: float = 400.0,
-    margin_px: float = 30.0,
+    margin_px: float = 40.0,
+    center_radius_px: float = 150.0,
 ) -> np.ndarray:
     """Build a binary mask of the road corridors radiating from the
-    intersection center. Uses OSM leg bearings to draw thick lines
-    outward from center.
+    intersection center, plus a circle covering the intersection itself.
 
     road_half_width_px + margin_px determines how wide the mask is on
-    each side of the road centerline. At 0.12 m/px, 80px ≈ 10m which
-    covers a typical 2-lane road with some buffer."""
+    each side of the road centerline. center_radius_px covers the
+    intersection area where crosswalks sit between the legs."""
     mask = np.zeros(image_shape[:2], dtype=np.uint8)
     thickness = int(2 * (road_half_width_px + margin_px))
     cx, cy = int(center_px[0]), int(center_px[1])
+    # Circle covering the intersection center area.
+    cv2.circle(mask, (cx, cy), int(center_radius_px), 255, -1)
+    # Road corridors radiating outward.
     for bearing in leg_bearings_deg:
         angle_rad = math.radians(bearing)
         dx = math.sin(angle_rad) * length_px
@@ -511,16 +566,25 @@ def group_stripes_into_arrays(
 # ---------- visualization ----------
 
 def draw_overlay(image_bgr: np.ndarray, arrays: list[StripeArray]) -> np.ndarray:
-    """Render an overlay showing detected stripes (green) and array centroids
-    (red dot + label) on top of the input image. Useful for debugging."""
+    """Render an overlay showing detected stripes (green rotated boxes) and
+    array centroids (red dot + label) on top of the input image."""
     out = image_bgr.copy()
     for i, arr in enumerate(arrays):
         for s in arr.stripes:
-            pts = s.contour
-            x_min, y_min = pts.min(axis=0)
-            x_max, y_max = pts.max(axis=0)
-            cv2.rectangle(out, (int(x_min), int(y_min)), (int(x_max), int(y_max)),
-                          (0, 200, 0), 1)
+            # Draw a rotated rectangle matching the stripe's PCA orientation.
+            cos_a = math.cos(math.radians(s.angle_deg))
+            sin_a = math.sin(math.radians(s.angle_deg))
+            u = np.array([cos_a, sin_a])   # along long axis
+            v = np.array([-sin_a, cos_a])   # along short axis
+            c = np.array([s.cx, s.cy])
+            hl, hw = s.length_px / 2, s.width_px / 2
+            corners = np.array([
+                c + hl * u + hw * v,
+                c - hl * u + hw * v,
+                c - hl * u - hw * v,
+                c + hl * u - hw * v,
+            ], dtype=np.int32)
+            cv2.polylines(out, [corners], isClosed=True, color=(0, 200, 0), thickness=1)
         cx, cy = arr.centroid
         cv2.circle(out, (int(cx), int(cy)), 4, (0, 0, 255), -1)
         cv2.putText(out, f"#{i} n={arr.n_stripes} cv={arr.pitch_cv:.2f}",
