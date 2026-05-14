@@ -45,11 +45,21 @@ from crosswalk_pcb.osm import build_query, extract_junctions, rank_candidates, r
 
 # Same area definitions as find_intersections.py.
 AREAS: dict[str, tuple[float, float, float, float]] = {
+    # San Francisco
     "sf-soma":      (37.770, -122.420, 37.790, -122.395),
     "sf-mission":   (37.745, -122.430, 37.770, -122.405),
     "sf-sunset":    (37.755, -122.510, 37.775, -122.470),
     "sf-richmond":  (37.770, -122.510, 37.790, -122.470),
     "sf-all":       (37.708, -122.515, 37.815, -122.355),
+    # New York City
+    "nyc-midtown":  (40.748, -73.990, 40.762, -73.975),  # Times Sq to Grand Central
+    "nyc-chelsea":  (40.740, -74.002, 40.752, -73.990),  # Chelsea / Flatiron
+    "nyc-les":      (40.715, -73.995, 40.725, -73.982),  # Lower East Side
+    "nyc-uws":      (40.775, -73.985, 40.790, -73.970),  # Upper West Side
+    "nyc-bk-slope": (40.670, -73.985, 40.682, -73.972),  # Park Slope, Brooklyn
+    # Detroit — grid is nearly N-S aligned
+    "det-midtown":  (42.330, -83.055, 42.345, -83.040),  # Midtown Detroit
+    "det-corktown": (42.325, -83.075, 42.340, -83.055),  # Corktown / Michigan Ave
 }
 
 
